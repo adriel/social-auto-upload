@@ -52,7 +52,13 @@ async def cookie_auth(account_file) -> bool:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True, channel="chrome")
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await browser.new_context(
+                storage_state=account_file,
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+                ),
+            )
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(STUDIO_URL, wait_until="domcontentloaded")
@@ -154,12 +160,37 @@ async def _click_if_present(page: Page, selector: str, timeout: int = 4000) -> b
         return False
 
 
-async def _wait_upload_complete(page: Page, max_polls: int = 360) -> bool:
-    """等网页上传从 X% 跑到 100% 再发布。浏览器上传靠窗口开着才传得完，
-    若上传到一半就点发布并关闭浏览器，上传会被掐断卡在中途（如 76%）。
-    出现“处理/检查/上传完成”或不再“正在上传”即视为传完。max_polls*5s=30min 上限。"""
-    last = ""
+async def _select_visibility(page: Page, visibility: str, max_polls: int = 20) -> bool:
+    """Select a visibility option and verify that Studio accepted it."""
+    radio = page.locator(
+        f"tp-yt-paper-radio-button[name='{VISIBILITY[visibility]}']"
+    ).first
+    await radio.wait_for(state="visible", timeout=10000)
+    await radio.click()
     for _ in range(max_polls):
+        if await radio.get_attribute("aria-checked") == "true":
+            return True
+        await page.wait_for_timeout(250)
+    return False
+
+
+async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
+    """Wait until Studio enables Publish/Save rather than guessing from status text.
+
+    Labels such as "Checks complete" can appear while the file upload is still in
+    progress. The enabled #done-button is the UI's authoritative ready signal.
+    max_polls*1s gives a 30-minute upper bound.
+    """
+    last = ""
+    done_button = page.locator("#done-button").first
+    for _ in range(max_polls):
+        try:
+            if await done_button.is_enabled():
+                youtube_logger.info(_msg("✅", "上传完成，发布按钮已可用"))
+                return True
+        except Exception:
+            pass
+
         txt = ""
         for sel in (".progress-label", "span.progress-label", "ytcp-video-upload-progress"):
             loc = page.locator(sel).first
@@ -171,15 +202,35 @@ async def _wait_upload_complete(page: Page, max_polls: int = 360) -> bool:
             except Exception:
                 pass
         if txt:
-            if any(k in txt for k in ("处理", "检查", "上传完成", "已上传", "Processing", "complete", "Checks", "Finished")):
-                youtube_logger.info(_msg("✅", f"上传完成: {txt[:40]}"))
-                return True
             if txt != last:
                 youtube_logger.info(_msg("⏳", f"上传中: {txt[:40]}"))
                 last = txt
-        await page.wait_for_timeout(5000)
-    youtube_logger.warning(_msg("⚠️", "等上传超时(30min)，仍尝试发布"))
+        await page.wait_for_timeout(1000)
+    youtube_logger.error(_msg("😵", "等上传超时(30min)，发布按钮仍不可用"))
     return False
+
+
+async def _publish_video(page: Page, max_polls: int = 240) -> str:
+    """Click Publish only when enabled, then wait for Studio's success dialog."""
+    done_button = page.locator("#done-button").first
+    await done_button.wait_for(state="visible", timeout=15000)
+    for _ in range(max_polls):
+        if await done_button.is_enabled():
+            break
+        await page.wait_for_timeout(250)
+    else:
+        raise RuntimeError("YouTube 发布按钮一直不可用；视频未发布")
+
+    await done_button.click()
+    link = page.locator(
+        "ytcp-video-share-dialog a[href*='youtu.be'], "
+        "ytcp-video-share-dialog a[href*='watch?v=']"
+    ).first
+    try:
+        await link.wait_for(state="visible", timeout=60000)
+    except Exception as exc:
+        raise RuntimeError("YouTube 未确认发布成功；视频可能仍是草稿") from exc
+    return await link.get_attribute("href") or ""
 
 
 class YouTubeVideo(BaseVideoUploader):
@@ -202,8 +253,31 @@ class YouTubeVideo(BaseVideoUploader):
             headless=self.headless, channel="chrome",
             proxy={"server": YT_PROXY} if YT_PROXY else None,
         )
-        context = await browser.new_context(storage_state=self.account_file)
+        context = await browser.new_context(
+            storage_state=self.account_file,
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+            ) if self.headless else None,
+        )
         context = await set_init_script(context)
+
+        async def _bring_new_pages_to_front(new_page):
+            """The "Verify that it's you" reauth step opens a NEW tab
+            (window.open), which nothing here otherwise tracks or
+            attaches to. Left alone, that new target can sit stuck --
+            observed in practice as Chrome's own "Debugger paused in
+            another tab" banner, which only clears once a human manually
+            clicks over to that tab. Doing that click programmatically,
+            the instant the tab exists, avoids needing a human to notice
+            and switch to it themselves."""
+            try:
+                await new_page.bring_to_front()
+            except Exception:
+                pass
+
+        context.on("page", lambda p: asyncio.create_task(_bring_new_pages_to_front(p)))
+
         page = await context.new_page()
         page.set_default_timeout(60000)
 
@@ -297,35 +371,32 @@ class YouTubeVideo(BaseVideoUploader):
 
         # 10) 可见性
         youtube_logger.info(_msg("🌐", f"设置可见性 = {self.visibility}"))
-        await _click_if_present(page, f"tp-yt-paper-radio-button[name='{VISIBILITY[self.visibility]}']", 10000)
+        if not await _select_visibility(page, self.visibility):
+            raise RuntimeError(f"YouTube 未能设置可见性为 {self.visibility}")
 
         # 10.5) 关键：等上传真正传完再发布。浏览器上传靠窗口开着传，
         #       传到一半就点发布+关浏览器 = 上传被掐断卡在中途（如 76%）。
         youtube_logger.info(_msg("📤", "等待上传完成（传完才发布）…"))
-        await _wait_upload_complete(page)
+        if not await _wait_upload_complete(page):
+            raise RuntimeError("YouTube 上传未完成；没有关闭为草稿并假报成功")
 
         # 11) 发布
-        await page.wait_for_timeout(1200)
-        if not await _click_if_present(page, "#done-button", 15000):
-            youtube_logger.warning(_msg("🤔", "未找到发布按钮，可能上传未到可发布进度；请在窗口里手动发布"))
-        else:
-            await page.wait_for_timeout(4000)
-            video_url = ""
-            try:
-                link = page.locator("a[href*='youtu.be'], a[href*='watch?v=']").first
-                if await link.count():
-                    video_url = await link.get_attribute("href") or ""
-            except Exception:
-                pass
-            await _click_if_present(page, "ytcp-button:has-text('Close'), ytcp-button:has-text('关闭'), #close-button", 8000)
-            youtube_logger.success(_msg("🥳", f"发布完成（{self.visibility}）{(' ' + video_url) if video_url else ''}"))
+        video_url = await _publish_video(page)
+        await _click_if_present(
+            page,
+            "ytcp-video-share-dialog ytcp-button:has-text('Close'), "
+            "ytcp-video-share-dialog ytcp-button:has-text('关闭'), #close-button",
+            8000,
+        )
+        youtube_logger.success(
+            _msg("🥳", f"发布完成（{self.visibility}）{(' ' + video_url) if video_url else ''}")
+        )
 
         # 刷新 cookie
         try:
             await context.storage_state(path=self.account_file)
         except Exception:
             pass
-        await page.wait_for_timeout(2000)
         await browser.close()
 
     async def main(self):
