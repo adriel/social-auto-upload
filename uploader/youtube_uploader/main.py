@@ -12,10 +12,18 @@ Login is interactive (Google account, no QR code): the browser opens, the user s
 the storage_state is saved. Reuse it afterwards for fully unattended uploads.
 """
 import asyncio
+import os
 import re
 from pathlib import Path
 
 from patchright.async_api import Page, Playwright, async_playwright
+
+try:
+    # Patchright only supports Chromium. Use the regular Playwright package for
+    # the opt-in WebKit experiment instead of routing WebKit through Patchright.
+    from playwright.async_api import async_playwright as _standard_async_playwright
+except ImportError:
+    _standard_async_playwright = None
 
 from conf import DEBUG_MODE
 from uploader.base_video import BaseVideoUploader
@@ -32,6 +40,39 @@ except Exception:
 STUDIO_URL = "https://studio.youtube.com"
 UPLOAD_URL = "https://www.youtube.com/upload"
 VISIBILITY = {"public": "PUBLIC", "unlisted": "UNLISTED", "private": "PRIVATE"}
+
+
+def _get_browser_engine() -> str:
+    """Return the upload browser engine selected by the environment."""
+    engine = os.environ.get("YT_BROWSER", "chrome").strip().lower()
+    if engine not in {"chrome", "webkit"}:
+        raise ValueError("YT_BROWSER must be 'chrome' or 'webkit'")
+    return engine
+
+
+def _get_browser_type(playwright: Playwright, engine=None):
+    """Return the Patchright browser type for an upload engine."""
+    engine = _get_browser_engine() if engine is None else engine
+    if engine == "webkit":
+        return playwright.webkit
+    if engine == "chrome":
+        return playwright.chromium
+    raise ValueError("YT_BROWSER must be 'chrome' or 'webkit'")
+
+
+def _get_async_playwright_factory(engine=None):
+    """Choose the Playwright implementation that supports the selected engine."""
+    engine = _get_browser_engine() if engine is None else engine
+    if engine == "webkit":
+        if _standard_async_playwright is None:
+            raise RuntimeError(
+                "YT_BROWSER=webkit requires the standard Playwright package; "
+                "install it with: python -m pip install playwright"
+            )
+        return _standard_async_playwright
+    if engine == "chrome":
+        return async_playwright
+    raise ValueError("YT_BROWSER must be 'chrome' or 'webkit'")
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -301,16 +342,21 @@ class YouTubeVideo(BaseVideoUploader):
         self.headless = headless
 
     async def upload(self, playwright: Playwright) -> None:
-        browser = await playwright.chromium.launch(
-            headless=self.headless, channel="chrome",
-            proxy={"server": YT_PROXY} if YT_PROXY else None,
-        )
+        browser_engine = _get_browser_engine()
+        browser_type = _get_browser_type(playwright, browser_engine)
+        launch_options = {
+            "headless": self.headless,
+            "proxy": {"server": YT_PROXY} if YT_PROXY else None,
+        }
+        if browser_engine == "chrome":
+            launch_options["channel"] = "chrome"
+        browser = await browser_type.launch(**launch_options)
         context = await browser.new_context(
             storage_state=self.account_file,
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-            ) if self.headless else None,
+            ) if self.headless and browser_engine == "chrome" else None,
         )
         context = await set_init_script(context)
 
@@ -334,6 +380,7 @@ class YouTubeVideo(BaseVideoUploader):
         page.set_default_timeout(60000)
 
         youtube_logger.info(_msg("🎬", f"Starting upload: {Path(self.file_path).name}"))
+        youtube_logger.info(_msg("🌐", f"Browser engine: {browser_engine}"))
         youtube_logger.info(_msg("🌐", "Opening the YouTube upload page"))
         file_input = await _open_upload_page(page)
         youtube_logger.info(_msg("✅", "Upload page ready; selecting the video file"))
@@ -450,5 +497,6 @@ class YouTubeVideo(BaseVideoUploader):
         await browser.close()
 
     async def main(self):
-        async with async_playwright() as playwright:
+        engine = _get_browser_engine()
+        async with _get_async_playwright_factory(engine)() as playwright:
             await self.upload(playwright)
