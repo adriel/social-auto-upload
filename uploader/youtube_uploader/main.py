@@ -40,11 +40,12 @@ except Exception:
 STUDIO_URL = "https://studio.youtube.com"
 UPLOAD_URL = "https://www.youtube.com/upload"
 VISIBILITY = {"public": "PUBLIC", "unlisted": "UNLISTED", "private": "PRIVATE"}
+DEFAULT_BROWSER_ENGINE = "webkit"
 
 
 def _get_browser_engine() -> str:
     """Return the upload browser engine selected by the environment."""
-    engine = os.environ.get("YT_BROWSER", "chrome").strip().lower()
+    engine = os.environ.get("YT_BROWSER", DEFAULT_BROWSER_ENGINE).strip().lower()
     if engine not in {"chrome", "webkit"}:
         raise ValueError("YT_BROWSER must be 'chrome' or 'webkit'")
     return engine
