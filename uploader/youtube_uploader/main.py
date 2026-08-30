@@ -189,6 +189,14 @@ async def _open_upload_page(page: Page):
     return file_input
 
 
+async def _wait_for_details_editor(page: Page):
+    """Wait until the real editable title field is ready for input."""
+    title_box = page.locator(
+        "#title-textarea #textbox[contenteditable='true']"
+    ).first
+    await title_box.wait_for(state="visible", timeout=60000)
+
+
 async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
     """Wait for the browser-to-YouTube file transfer to finish.
 
@@ -206,7 +214,8 @@ async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
     for _ in range(max_polls):
         try:
             texts = await progress.all_inner_texts()
-            status = " | ".join(text.strip() for text in texts if text.strip())
+            unique_texts = dict.fromkeys(text.strip() for text in texts if text.strip())
+            status = " | ".join(unique_texts)
         except Exception:
             try:
                 status = (await progress.first.inner_text()).strip()
@@ -334,7 +343,7 @@ class YouTubeVideo(BaseVideoUploader):
 
         # 2) Wait for the details editor.
         youtube_logger.info(_msg("⏳", "Waiting for the video details editor"))
-        await page.locator("#title-textarea").wait_for(state="visible", timeout=120000)
+        await _wait_for_details_editor(page)
 
         # 3) Title.
         youtube_logger.info(_msg("✍️", "Entering title"))
