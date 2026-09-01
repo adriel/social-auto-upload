@@ -178,6 +178,33 @@ def _remote_content_length(url: str, log=None):
     return int(length)
 
 
+def _run_sau_streaming(cmd, log=None):
+    """Run the sau subprocess, streaming its output live line-by-line instead of
+    buffering everything until it exits. subprocess.run(capture_output=True) (the
+    old approach) produces nothing at all until the WHOLE upload -- multi-GB,
+    tens of minutes -- has finished, even with --verbose, which is why nothing
+    showed up while network traffic was visibly flowing. stdout/stderr are merged
+    (stderr=STDOUT) so interleaved lines print in the order sau actually emitted
+    them. Returns (returncode, combined_output) -- the combined text is still kept
+    so a failure can be reported/alerted in full, same as before.
+    """
+    lines = []
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    for raw_line in process.stdout:
+        line = _strip_ansi(raw_line.rstrip("\n"))
+        lines.append(line)
+        if log:
+            log(f"    {line}")
+    process.wait()
+    return process.returncode, "\n".join(lines)
+
+
 def load_state():
     return set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 
@@ -265,10 +292,9 @@ def main(args):
         if log:
             log(f"  {filename}: running sau upload-video ...")
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        stdout, stderr = _strip_ansi(result.stdout), _strip_ansi(result.stderr)
+        returncode, output = _run_sau_streaming(cmd, log=log)
 
-        if result.returncode == 0:
+        if returncode == 0:
             done.add(filename)
             save_state(done)
             local_path.unlink()
@@ -276,7 +302,7 @@ def main(args):
             if log:
                 log(f"  {filename}: state saved, local copy removed")
         else:
-            msg = f"sau upload failed for {filename}:\n{stdout}\n{stderr}"
+            msg = f"sau upload failed for {filename}:\n{output}"
             print(msg)
             notify_discord(f"GOES uploader: sau upload failed\n```\n{msg[:1500]}\n```")
             # Left on disk deliberately -- next run will reuse it (see the
