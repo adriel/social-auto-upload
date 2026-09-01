@@ -158,6 +158,26 @@ def _video_url_for(entry: dict) -> str:
     return base + entry["url"].lstrip("/")
 
 
+def _remote_content_length(url: str, log=None):
+    """HEAD the video URL and return its Content-Length, or None if that can't be
+    determined (server doesn't report one, HEAD isn't supported, network error, etc).
+    None means "can't verify" -- callers should treat that as "assume incomplete"
+    rather than risk uploading a truncated file."""
+    try:
+        resp = requests.head(url, timeout=30, allow_redirects=True)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        if log:
+            log(f"    HEAD request failed ({e.__class__.__name__}: {e}); can't verify existing file")
+        return None
+    length = resp.headers.get("Content-Length")
+    if length is None or not length.isdigit():
+        if log:
+            log("    HEAD response has no usable Content-Length; can't verify existing file")
+        return None
+    return int(length)
+
+
 def load_state():
     return set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 
@@ -194,23 +214,48 @@ def main(args):
         local_path = DOWNLOAD_DIR / filename
         DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-        if log:
-            log(f"  {filename}: downloading from {_redact_url(video_url)} ...")
-        try:
-            with requests.get(video_url, stream=True, timeout=120) as r:
-                r.raise_for_status()
-                with open(local_path, "wb") as f:
-                    for chunk in r.iter_content(1 << 20):
-                        f.write(chunk)
-        except requests.exceptions.RequestException as e:
-            msg = (f"couldn't download {filename} from {_redact_url(video_url)}: "
-                   f"{e.__class__.__name__}: {e} -- will retry next run")
-            print(msg)
-            notify_discord(f"GOES uploader: download failed\n```\n{msg}\n```")
-            local_path.unlink(missing_ok=True)
-            continue
-        if log:
-            log(f"  {filename}: downloaded {local_path.stat().st_size / 1e6:.0f} MB")
+        # If a previous run already got the full file down (e.g. the download
+        # succeeded but sau then failed, so the file was deliberately left on
+        # disk -- see the comment at the bottom of this loop), reuse it instead
+        # of spending several minutes re-pulling multiple GB over the network.
+        # Only trust it as complete when its size matches the remote
+        # Content-Length; anything else (partial file from a Ctrl-C, unknown
+        # remote size, size mismatch) is treated as stale and re-downloaded.
+        already_downloaded = False
+        if local_path.exists():
+            local_size = local_path.stat().st_size
+            if log:
+                log(f"  {filename}: found existing local file ({local_size / 1e6:.0f} MB), checking against remote ...")
+            remote_size = _remote_content_length(video_url, log=log)
+            if remote_size is not None and local_size == remote_size:
+                already_downloaded = True
+                if log:
+                    log(f"  {filename}: existing file matches remote size, reusing it (skipping download)")
+            else:
+                if log:
+                    reason = ("remote size unknown" if remote_size is None
+                               else f"local {local_size / 1e6:.0f} MB != remote {remote_size / 1e6:.0f} MB")
+                    log(f"  {filename}: existing file looks stale/partial ({reason}); deleting and re-downloading")
+                local_path.unlink()
+
+        if not already_downloaded:
+            if log:
+                log(f"  {filename}: downloading from {_redact_url(video_url)} ...")
+            try:
+                with requests.get(video_url, stream=True, timeout=120) as r:
+                    r.raise_for_status()
+                    with open(local_path, "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+            except requests.exceptions.RequestException as e:
+                msg = (f"couldn't download {filename} from {_redact_url(video_url)}: "
+                       f"{e.__class__.__name__}: {e} -- will retry next run")
+                print(msg)
+                notify_discord(f"GOES uploader: download failed\n```\n{msg}\n```")
+                local_path.unlink(missing_ok=True)
+                continue
+            if log:
+                log(f"  {filename}: downloaded {local_path.stat().st_size / 1e6:.0f} MB")
 
         cmd = [str(SAU_BIN), "youtube", "upload-video",
                "--account", SAU_ACCOUNT, "--file", str(local_path),
@@ -234,8 +279,9 @@ def main(args):
             msg = f"sau upload failed for {filename}:\n{stdout}\n{stderr}"
             print(msg)
             notify_discord(f"GOES uploader: sau upload failed\n```\n{msg[:1500]}\n```")
-            # Left on disk deliberately -- next run will re-download
-            # (harmless, sau wasn't the download's problem) and retry.
+            # Left on disk deliberately -- next run will reuse it (see the
+            # already_downloaded check above) rather than re-downloading, since
+            # sau wasn't the download's problem.
 
 
 def parse_args():
