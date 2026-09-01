@@ -300,14 +300,22 @@ async def _try_local_chrome_session(account_file) -> bool:
 
 
 async def youtube_setup(account_file, handle: bool = False, return_detail: bool = False, headless: bool = False):
-    """Validate the saved session and optionally open an interactive login."""
+    """Validate the saved session and optionally open an interactive login.
+
+    The local-Chrome-cookie attempt runs regardless of `handle` -- it's non-interactive
+    and cheap, so it's worth trying even on the `upload-video` path (handle=False), which
+    is the one that matters for an unattended run like a launchd/cron job: it lets that
+    path silently recover using an already-logged-in local Chrome session instead of just
+    failing with "run `sau youtube login` first". `handle` still gates ONLY the interactive
+    Playwright login window, which obviously can't run unattended.
+    """
     if not Path(account_file).exists() or not await cookie_auth(account_file):
-        if not handle:
-            result = _build_login_result(False, "cookie_invalid", "The session is missing or invalid", account_file)
-            return result if return_detail else False
         if await _try_local_chrome_session(account_file):
             result = _build_login_result(True, "cookie_valid", "Reused the local Chrome session", account_file)
             return result if return_detail else True
+        if not handle:
+            result = _build_login_result(False, "cookie_invalid", "The session is missing or invalid", account_file)
+            return result if return_detail else False
         youtube_logger.info(_msg("🥹", "The YouTube session is missing or invalid; opening the login window"))
         result = await youtube_cookie_gen(account_file, headless=headless)
         return result if return_detail else result["success"]
@@ -395,6 +403,9 @@ async def _wait_for_details_editor(page: Page):
     await title_box.wait_for(state="visible", timeout=60000)
 
 
+PROGRESS_LOG_BUCKET_PCT = 20  # Log a progress line at most once per 20% (~5 total for 0-100%).
+
+
 async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
     """Wait for the browser-to-YouTube file transfer to finish.
 
@@ -402,8 +413,13 @@ async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
     start while the transfer is still running. Read every progress label and require
     either an explicit upload-complete marker or two consecutive polls where an
     observed "Uploading N%" status has disappeared. max_polls*1s is a 30-minute cap.
+    Percent-based progress lines are throttled to roughly PROGRESS_LOG_BUCKET_PCT-sized
+    steps -- polling still happens every second, but a multi-GB upload otherwise logs a
+    near-identical "Uploading N% ... M minutes left" line every second for its whole
+    duration, which is noise rather than signal.
     """
     last = ""
+    last_logged_bucket = -1
     saw_uploading = False
     missing_after_upload = 0
     progress = page.locator(
@@ -426,6 +442,11 @@ async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
             saw_uploading = True
             missing_after_upload = 0
             percent = min(int(percent_match.group(1)), 100)
+            bucket = percent // PROGRESS_LOG_BUCKET_PCT
+            if bucket > last_logged_bucket:
+                last_logged_bucket = bucket
+                youtube_logger.info(_msg("⏳", f"Upload status: {status[:100]}"))
+            last = status
             if percent >= 100:
                 youtube_logger.info(_msg("✅", "File upload reached 100%"))
                 return True
@@ -437,10 +458,12 @@ async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
             if missing_after_upload >= 2:
                 youtube_logger.info(_msg("✅", "The upload progress indicator has completed"))
                 return True
-
-        if status and status != last:
+        elif status and status != last:
+            # Non-percent status text (rare) -- still worth logging on change; this
+            # isn't part of the once-per-second percent spam being throttled above.
             youtube_logger.info(_msg("⏳", f"Upload status: {status[:100]}"))
             last = status
+
         await page.wait_for_timeout(1000)
     youtube_logger.error(_msg("😵", "The file upload did not finish within 30 minutes"))
     return False
