@@ -469,23 +469,31 @@ async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
     return False
 
 
+PUBLISH_METADATA_UPDATE_PATH = "video_manager/metadata_update"
+
+
 async def _publish_video(page: Page, timeout_s: int = YT_PUBLISH_TIMEOUT_S,
                           poll_interval_ms: int = 500) -> str:
-    """Publish the uploaded video and return its confirmed public URL.
+    """Click Publish and return as soon as YouTube's own API confirms the publish
+    itself succeeded -- NOT once the video has finished background processing.
 
-    A large (4K, multi-GB) upload can leave YouTube's own post-upload
-    checks (copyright ID, monetization, etc.) running for several
-    minutes AFTER the file transfer itself hits 100%. Crucially, the
-    publish request has ALREADY been sent to YouTube's servers by the
-    time "Publish anyway" is clicked -- the video going public doesn't
-    depend on this function still watching, only on Studio's UI
-    eventually rendering a confirmation. So a short poll window here
-    doesn't protect against anything; it just risks THIS function
-    timing out and reporting failure on a video that YouTube quietly
-    finished publishing seconds later. Default is 10 minutes (override
-    via conf.py's YT_PUBLISH_TIMEOUT_S or the env var of the same name);
-    a heartbeat is logged periodically so a long wait doesn't look
-    stuck.
+    Per a captured HAR of a real successful publish: clicking Done/Publish triggers
+    exactly one POST to `.../youtubei/v1/video_manager/metadata_update`, whose JSON
+    body has `privacy.success: true` the moment the visibility change (draft ->
+    public/unlisted/private) actually takes effect server-side -- that IS the
+    publish. A `share/get_share_panel` call follows ~2s later, but that only
+    populates the confirmation dialog's UI; it doesn't reflect anything about
+    whether the video went live. Studio then keeps its own processing checks
+    (copyright ID, monetization, etc.) running for minutes afterwards regardless of
+    whether this browser is even still open -- there's nothing further worth
+    waiting for. A run was previously seen stuck 5+ minutes on the share dialog's
+    DOM (which doesn't reliably render/select the same way across every Studio UI
+    variant this project has hit) while the video had already been public the
+    whole time.
+
+    Falls back to polling the DOM (share link / Close button) if the network
+    response is somehow never seen, so this still works if Studio's response shape
+    changes.
     """
     done_button = page.locator("#done-button").first
     await done_button.wait_for(state="visible", timeout=15000)
@@ -496,66 +504,102 @@ async def _publish_video(page: Page, timeout_s: int = YT_PUBLISH_TIMEOUT_S,
     else:
         raise RuntimeError("The YouTube Publish button remained disabled; the video was not published")
 
-    await done_button.click(timeout=15000)
+    publish_result = {}  # "success" key present once the metadata_update response has been seen
 
-    publish_anyway = page.locator(
-        "ytcp-button:has-text('Publish anyway'), "
-        "tp-yt-paper-button:has-text('Publish anyway'), "
-        "button:has-text('Publish anyway')"
-    ).first
-    link = page.locator(
-        "ytcp-video-share-dialog a[href*='youtu.be'], "
-        "ytcp-video-share-dialog a[href*='watch?v=']"
-    ).first
-    # Some Studio UI variants render the share dialog's Close button
-    # without ever showing a matching <a href> (icon-only share link,
-    # layout differences) -- a visible Close button is just as strong a
-    # "publish actually finished" signal as the link itself, so it
-    # counts as success too, just without a URL to report. Same
-    # selector already used elsewhere in this file for the post-publish
-    # dialog dismissal, kept consistent here.
-    close_button = page.locator(
-        "ytcp-video-share-dialog ytcp-button:has-text('Close'), #close-button"
-    ).first
-
-    max_polls = max(1, int(timeout_s * 1000 / poll_interval_ms))
-    next_heartbeat_s = 15
-    logged_checks_running = False
-
-    for i in range(max_polls):
+    async def _on_response(response):
+        if PUBLISH_METADATA_UPDATE_PATH not in response.url or response.status != 200:
+            return
         try:
-            if await link.is_visible():
-                return await link.get_attribute("href") or ""
+            body = await response.json()
         except Exception:
-            pass
-        try:
-            if await close_button.is_visible():
-                return ""
-        except Exception:
-            pass
-        try:
-            if await publish_anyway.is_visible():
-                if not logged_checks_running:
-                    youtube_logger.info(_msg("ℹ️", "YouTube checks are still running; selecting Publish anyway"))
-                    logged_checks_running = True
-                await publish_anyway.click(timeout=5000)
-        except Exception:
-            pass
+            return
+        success = body.get("privacy", {}).get("success")
+        if success is None:
+            return  # not the shape expected; let the DOM fallback handle it
+        publish_result["success"] = bool(success)
 
-        elapsed_s = i * poll_interval_ms / 1000
-        if elapsed_s >= next_heartbeat_s:
-            youtube_logger.info(_msg("⏳", f"Still waiting for YouTube's publish confirmation "
-                                           f"({int(elapsed_s)}s elapsed, timeout {timeout_s}s)"))
-            next_heartbeat_s += 15
+    def _on_response_sync(response):
+        asyncio.create_task(_on_response(response))
 
-        await page.wait_for_timeout(poll_interval_ms)
+    page.on("response", _on_response_sync)
+    try:
+        await done_button.click(timeout=15000)
 
-    raise RuntimeError(
-        f"YouTube did not confirm publication within {timeout_s}s. The publish request was already "
-        f"sent to YouTube by this point -- clicking Publish/Publish anyway completes server-side "
-        f"regardless of whether this browser session is still watching -- so the video may well have "
-        f"gone public anyway. Check YouTube Studio's Content list before assuming this actually failed."
-    )
+        publish_anyway = page.locator(
+            "ytcp-button:has-text('Publish anyway'), "
+            "tp-yt-paper-button:has-text('Publish anyway'), "
+            "button:has-text('Publish anyway')"
+        ).first
+        link = page.locator(
+            "ytcp-video-share-dialog a[href*='youtu.be'], "
+            "ytcp-video-share-dialog a[href*='watch?v=']"
+        ).first
+        # Some Studio UI variants render the share dialog's Close button
+        # without ever showing a matching <a href> (icon-only share link,
+        # layout differences) -- a visible Close button is just as strong a
+        # "publish actually finished" signal as the link itself, so it
+        # counts as success too, just without a URL to report.
+        close_button = page.locator(
+            "ytcp-video-share-dialog ytcp-button:has-text('Close'), #close-button"
+        ).first
+
+        max_polls = max(1, int(timeout_s * 1000 / poll_interval_ms))
+        next_heartbeat_s = 15
+        logged_checks_running = False
+
+        for i in range(max_polls):
+            if "success" in publish_result:
+                if not publish_result["success"]:
+                    raise RuntimeError(
+                        "YouTube's metadata_update response reported the publish request "
+                        "itself failed -- the video was NOT published."
+                    )
+                video_url = ""
+                try:
+                    if await link.is_visible(timeout=2000):
+                        video_url = await link.get_attribute("href") or ""
+                except Exception:
+                    pass
+                youtube_logger.info(_msg("✅", "YouTube confirmed the publish "
+                                               "(it'll finish processing in the background)"))
+                return video_url
+
+            # DOM fallback, kept in case the network response is ever missed.
+            try:
+                if await link.is_visible():
+                    return await link.get_attribute("href") or ""
+            except Exception:
+                pass
+            try:
+                if await close_button.is_visible():
+                    return ""
+            except Exception:
+                pass
+            try:
+                if await publish_anyway.is_visible():
+                    if not logged_checks_running:
+                        youtube_logger.info(_msg("ℹ️", "YouTube checks are still running; selecting Publish anyway"))
+                        logged_checks_running = True
+                    await publish_anyway.click(timeout=5000)
+            except Exception:
+                pass
+
+            elapsed_s = i * poll_interval_ms / 1000
+            if elapsed_s >= next_heartbeat_s:
+                youtube_logger.info(_msg("⏳", f"Still waiting for YouTube's publish confirmation "
+                                               f"({int(elapsed_s)}s elapsed, timeout {timeout_s}s)"))
+                next_heartbeat_s += 15
+
+            await page.wait_for_timeout(poll_interval_ms)
+
+        raise RuntimeError(
+            f"YouTube did not confirm publication within {timeout_s}s. The publish request was already "
+            f"sent to YouTube by this point -- clicking Publish/Publish anyway completes server-side "
+            f"regardless of whether this browser session is still watching -- so the video may well have "
+            f"gone public anyway. Check YouTube Studio's Content list before assuming this actually failed."
+        )
+    finally:
+        page.remove_listener("response", _on_response_sync)
 
 class YouTubeVideo(BaseVideoUploader):
     def __init__(self, title, file_path, tags, account_file, *,
