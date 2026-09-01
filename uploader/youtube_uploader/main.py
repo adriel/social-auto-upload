@@ -10,10 +10,21 @@ used by every other uploader in this project.
 
 Login is interactive (Google account, no QR code): the browser opens, the user signs in, and
 the storage_state is saved. Reuse it afterwards for fully unattended uploads.
+
+Session bootstrap order (when handle=True and no valid saved session exists):
+    1. Try reusing the local machine's already-logged-in Chrome session (via browser_cookie3),
+       if that library is installed and Chrome has a live Google session. This only ever
+       succeeds when running on a machine with a real Chrome profile (e.g. your desktop Mac),
+       not on the headless server.
+    2. If that's unavailable or doesn't validate, fall back to the original interactive
+       Playwright login window (youtube_cookie_gen), unchanged from before.
 """
 import asyncio
+import json
 import os
 import re
+import sys
+import traceback
 from pathlib import Path
 
 from patchright.async_api import Page, Playwright, async_playwright
@@ -36,6 +47,11 @@ try:
     from conf import YT_PROXY
 except Exception:
     YT_PROXY = None
+
+try:
+    from conf import YT_PUBLISH_TIMEOUT_S
+except Exception:
+    YT_PUBLISH_TIMEOUT_S = int(os.environ.get("YT_PUBLISH_TIMEOUT_S", "600"))
 
 STUDIO_URL = "https://studio.youtube.com"
 UPLOAD_URL = "https://www.youtube.com/upload"
@@ -146,12 +162,152 @@ async def youtube_cookie_gen(account_file, headless: bool = False):
                                    "Login succeeded" if ok else "Login timed out", account_file, page.url)
 
 
+_KEY_AUTH_COOKIE_NAMES = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "LOGIN_INFO",
+}
+
+
+def _debug(msg: str):
+    """Diagnostic line for the local-Chrome-cookie path. Always written to stderr,
+    unconditionally -- NOT gated behind youtube_logger's configured level -- so it
+    shows up even when this runs unattended via something like mac_uploader.py's
+    subprocess.run(capture_output=True), which only prints stdout/stderr and only
+    on failure."""
+    print(f"[local-chrome-cookies] {msg}", file=sys.stderr, flush=True)
+
+
+def _load_local_chrome_cookiejar():
+    """Pull Google/YouTube cookies out of the local machine's own Chrome profile.
+
+    Only works where a real Chrome profile exists (e.g. your desktop Mac) — browser_cookie3
+    reads Chrome's on-disk cookie DB and decrypts it via the OS keychain (macOS will prompt
+    for Keychain access the first time this runs). Raises on any failure; callers decide how
+    to handle that.
+    """
+    import browser_cookie3  # Optional dependency; imported lazily so the rest of this
+                             # module works fine without it installed.
+
+    _debug(f"browser_cookie3 module: {getattr(browser_cookie3, '__file__', 'unknown')}")
+
+    jar = browser_cookie3.chrome(domain_name="google.com")
+    google_count = sum(1 for _ in jar)
+    _debug(f"domain_name='google.com' -> {google_count} cookie(s)")
+
+    yt_count = 0
+    for cookie in browser_cookie3.chrome(domain_name="youtube.com"):
+        jar.set_cookie(cookie)
+        yt_count += 1
+    _debug(f"domain_name='youtube.com' -> {yt_count} cookie(s)")
+
+    found_key_names = sorted({c.name for c in jar if c.name in _KEY_AUTH_COOKIE_NAMES})
+    _debug(f"key auth cookie names present: {found_key_names or 'NONE'}")
+    if not found_key_names:
+        _debug("no recognizable Google auth cookies -- Chrome likely isn't signed "
+               "into a Google account in this profile (or it's a different profile "
+               "than the one you're signed in on, e.g. a work profile vs personal)")
+
+    return jar
+
+
+def _cookiejar_to_storage_state(jar) -> dict:
+    """Convert an http.cookiejar.CookieJar into Playwright's storage_state shape.
+
+    SameSite isn't preserved by http.cookiejar, so it's reconstructed with a heuristic
+    (secure cookies -> "None", everything else -> "Lax"). Good enough to replay the
+    session; it doesn't need to match the original attribute exactly.
+    """
+    cookies = []
+    for c in jar:
+        cookies.append({
+            "name": c.name,
+            "value": c.value,
+            "domain": c.domain,
+            "path": c.path or "/",
+            "expires": c.expires if c.expires else -1,
+            "httpOnly": bool(getattr(c, "_rest", {}).get("HttpOnly", False)),
+            "secure": bool(c.secure),
+            "sameSite": "None" if c.secure else "Lax",
+        })
+    return {"cookies": cookies, "origins": []}
+
+
+async def _try_local_chrome_session(account_file) -> bool:
+    """Attempt to bootstrap account_file from the local machine's logged-in Chrome session.
+
+    Returns False (leaving account_file untouched) on any failure — missing dependency,
+    no Chrome profile, no cookies found, or the resulting session not validating against
+    YouTube Studio — so the caller can fall back to the interactive login unchanged.
+    Set YT_SKIP_LOCAL_CHROME=1 to disable this path entirely (e.g. on the headless server).
+    """
+    if os.environ.get("YT_SKIP_LOCAL_CHROME"):
+        _debug("skipped: YT_SKIP_LOCAL_CHROME is set")
+        return False
+
+    _debug("attempting to reuse the local Chrome session ...")
+
+    try:
+        import browser_cookie3  # noqa: F401
+    except ImportError as exc:
+        _debug(f"skipped: browser_cookie3 is not installed ({exc})")
+        youtube_logger.info(_msg("ℹ️", "browser_cookie3 not installed; skipping local Chrome cookie pull"))
+        return False
+
+    try:
+        jar = _load_local_chrome_cookiejar()
+        storage_state = _cookiejar_to_storage_state(jar)
+    except Exception as exc:
+        _debug(f"failed reading local Chrome cookies: {exc.__class__.__name__}: {exc}")
+        _debug(traceback.format_exc())
+        youtube_logger.info(_msg("ℹ️", f"Could not read local Chrome cookies, skipping: {exc}"))
+        return False
+
+    _debug(f"built storage_state with {len(storage_state['cookies'])} cookie(s) total")
+    if not storage_state["cookies"]:
+        _debug("skipped: no Google/YouTube cookies found in local Chrome")
+        youtube_logger.info(_msg("ℹ️", "No Google/YouTube cookies found in local Chrome"))
+        return False
+
+    candidate_file = f"{account_file}.local-chrome-tmp"
+    try:
+        with open(candidate_file, "w") as f:
+            json.dump(storage_state, f)
+        _debug(f"wrote candidate session to {candidate_file}, validating against YouTube Studio ...")
+        valid = await cookie_auth(candidate_file)
+        _debug(f"cookie_auth() -> {valid}")
+        if valid:
+            os.replace(candidate_file, account_file)
+            youtube_logger.success(_msg("✅", "Reused the local Chrome session for YouTube Studio"))
+            return True
+        _debug("cookie_auth() rejected the candidate session -- either the Chrome cookies "
+               "aren't actually signed in to Studio's channel, or cookie_auth's own headless "
+               "Chrome launch is itself getting blocked/redirected (e.g. the same UA/bot checks "
+               "documented elsewhere in this file for headless sessions)")
+        youtube_logger.info(_msg("ℹ️", "Local Chrome cookies didn't produce a valid YouTube Studio session"))
+        return False
+    except Exception as exc:
+        _debug(f"failed validating candidate session: {exc.__class__.__name__}: {exc}")
+        _debug(traceback.format_exc())
+        youtube_logger.info(_msg("ℹ️", f"Local Chrome session check failed, skipping: {exc}"))
+        return False
+    finally:
+        try:
+            if os.path.exists(candidate_file):
+                os.remove(candidate_file)
+        except Exception:
+            pass
+
+
 async def youtube_setup(account_file, handle: bool = False, return_detail: bool = False, headless: bool = False):
     """Validate the saved session and optionally open an interactive login."""
     if not Path(account_file).exists() or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "The session is missing or invalid", account_file)
             return result if return_detail else False
+        if await _try_local_chrome_session(account_file):
+            result = _build_login_result(True, "cookie_valid", "Reused the local Chrome session", account_file)
+            return result if return_detail else True
         youtube_logger.info(_msg("🥹", "The YouTube session is missing or invalid; opening the login window"))
         result = await youtube_cookie_gen(account_file, headless=headless)
         return result if return_detail else result["success"]
@@ -290,11 +446,27 @@ async def _wait_upload_complete(page: Page, max_polls: int = 1800) -> bool:
     return False
 
 
-async def _publish_video(page: Page, max_polls: int = 240) -> str:
-    """Publish the uploaded video and return its confirmed public URL."""
+async def _publish_video(page: Page, timeout_s: int = YT_PUBLISH_TIMEOUT_S,
+                          poll_interval_ms: int = 500) -> str:
+    """Publish the uploaded video and return its confirmed public URL.
+
+    A large (4K, multi-GB) upload can leave YouTube's own post-upload
+    checks (copyright ID, monetization, etc.) running for several
+    minutes AFTER the file transfer itself hits 100%. Crucially, the
+    publish request has ALREADY been sent to YouTube's servers by the
+    time "Publish anyway" is clicked -- the video going public doesn't
+    depend on this function still watching, only on Studio's UI
+    eventually rendering a confirmation. So a short poll window here
+    doesn't protect against anything; it just risks THIS function
+    timing out and reporting failure on a video that YouTube quietly
+    finished publishing seconds later. Default is 10 minutes (override
+    via conf.py's YT_PUBLISH_TIMEOUT_S or the env var of the same name);
+    a heartbeat is logged periodically so a long wait doesn't look
+    stuck.
+    """
     done_button = page.locator("#done-button").first
     await done_button.wait_for(state="visible", timeout=15000)
-    for _ in range(max_polls):
+    for _ in range(240):
         if await done_button.is_enabled():
             break
         await page.wait_for_timeout(250)
@@ -302,6 +474,7 @@ async def _publish_video(page: Page, max_polls: int = 240) -> str:
         raise RuntimeError("The YouTube Publish button remained disabled; the video was not published")
 
     await done_button.click(timeout=15000)
+
     publish_anyway = page.locator(
         "ytcp-button:has-text('Publish anyway'), "
         "tp-yt-paper-button:has-text('Publish anyway'), "
@@ -311,21 +484,55 @@ async def _publish_video(page: Page, max_polls: int = 240) -> str:
         "ytcp-video-share-dialog a[href*='youtu.be'], "
         "ytcp-video-share-dialog a[href*='watch?v=']"
     ).first
-    for _ in range(max_polls):
+    # Some Studio UI variants render the share dialog's Close button
+    # without ever showing a matching <a href> (icon-only share link,
+    # layout differences) -- a visible Close button is just as strong a
+    # "publish actually finished" signal as the link itself, so it
+    # counts as success too, just without a URL to report. Same
+    # selector already used elsewhere in this file for the post-publish
+    # dialog dismissal, kept consistent here.
+    close_button = page.locator(
+        "ytcp-video-share-dialog ytcp-button:has-text('Close'), #close-button"
+    ).first
+
+    max_polls = max(1, int(timeout_s * 1000 / poll_interval_ms))
+    next_heartbeat_s = 15
+    logged_checks_running = False
+
+    for i in range(max_polls):
         try:
             if await link.is_visible():
                 return await link.get_attribute("href") or ""
         except Exception:
             pass
         try:
+            if await close_button.is_visible():
+                return ""
+        except Exception:
+            pass
+        try:
             if await publish_anyway.is_visible():
-                youtube_logger.info(_msg("ℹ️", "YouTube checks are still running; selecting Publish anyway"))
+                if not logged_checks_running:
+                    youtube_logger.info(_msg("ℹ️", "YouTube checks are still running; selecting Publish anyway"))
+                    logged_checks_running = True
                 await publish_anyway.click(timeout=5000)
         except Exception:
             pass
-        await page.wait_for_timeout(250)
-    raise RuntimeError("YouTube did not confirm publication; the video may still be a draft")
 
+        elapsed_s = i * poll_interval_ms / 1000
+        if elapsed_s >= next_heartbeat_s:
+            youtube_logger.info(_msg("⏳", f"Still waiting for YouTube's publish confirmation "
+                                           f"({int(elapsed_s)}s elapsed, timeout {timeout_s}s)"))
+            next_heartbeat_s += 15
+
+        await page.wait_for_timeout(poll_interval_ms)
+
+    raise RuntimeError(
+        f"YouTube did not confirm publication within {timeout_s}s. The publish request was already "
+        f"sent to YouTube by this point -- clicking Publish/Publish anyway completes server-side "
+        f"regardless of whether this browser session is still watching -- so the video may well have "
+        f"gone public anyway. Check YouTube Studio's Content list before assuming this actually failed."
+    )
 
 class YouTubeVideo(BaseVideoUploader):
     def __init__(self, title, file_path, tags, account_file, *,
