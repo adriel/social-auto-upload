@@ -55,6 +55,8 @@ except Exception:
 
 STUDIO_URL = "https://studio.youtube.com"
 UPLOAD_URL = "https://www.youtube.com/upload"
+STUDIO_CHANNEL_UPLOAD_URL_TEMPLATE = "https://studio.youtube.com/channel/{channel_id}/videos/upload"
+_CHANNEL_ID_RE = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
 VISIBILITY = {"public": "PUBLIC", "unlisted": "UNLISTED", "private": "PRIVATE"}
 DEFAULT_BROWSER_ENGINE = "webkit"
 
@@ -385,9 +387,28 @@ async def _select_visibility(page: Page, visibility: str, max_polls: int = 20) -
     return False
 
 
-async def _open_upload_page(page: Page):
-    """Open YouTube's upload page and return its real file input when ready."""
-    await page.goto(UPLOAD_URL, wait_until="domcontentloaded")
+async def _resolve_channel_id(page: Page, channel: str) -> str:
+    """Resolve a channel handle ('@USA_weather_sat', with or without the '@') or an
+    already-raw channel ID ('UC...', 24 chars) to its raw channel ID. Studio's
+    per-channel URLs need the raw ID; a handle is resolved by visiting its public
+    youtube.com page and pulling the canonical channel ID out of it."""
+    channel = channel.strip()
+    if _CHANNEL_ID_RE.match(channel):
+        return channel
+    handle = channel if channel.startswith("@") else f"@{channel}"
+    url = f"https://www.youtube.com/{handle}"
+    await page.goto(url, wait_until="domcontentloaded")
+    html = await page.content()
+    match = re.search(r'"channelId":"(UC[0-9A-Za-z_-]{22})"', html)
+    if not match:
+        raise RuntimeError(f"Couldn't resolve a channel ID for '{channel}' from {url}")
+    return match.group(1)
+
+
+async def _open_upload_page(page: Page, upload_url: str = UPLOAD_URL):
+    """Open YouTube's upload page (optionally scoped to a specific channel via
+    upload_url) and return its real file input when ready."""
+    await page.goto(upload_url, wait_until="domcontentloaded")
     if "accounts.google.com" in page.url or "signin" in page.url.lower():
         raise RuntimeError("The YouTube session has expired; run the login command again")
     file_input = page.locator('input[type="file"]').first
@@ -604,7 +625,7 @@ async def _publish_video(page: Page, timeout_s: int = YT_PUBLISH_TIMEOUT_S,
 class YouTubeVideo(BaseVideoUploader):
     def __init__(self, title, file_path, tags, account_file, *,
                  description="", thumbnail_path=None, playlist=None,
-                 visibility="public", debug=DEBUG_MODE, headless=False):
+                 visibility="public", debug=DEBUG_MODE, headless=False, channel=None):
         self.title = title
         self.file_path = str(file_path)
         self.tags = tags or []
@@ -615,6 +636,12 @@ class YouTubeVideo(BaseVideoUploader):
         self.visibility = visibility if visibility in VISIBILITY else "public"
         self.debug = debug
         self.headless = headless
+        # Which channel to post to, when the logged-in Google account manages more
+        # than one (e.g. its default/last-active channel isn't the one you want).
+        # Accepts a handle ('@USA_weather_sat') or a raw channel ID ('UC...').
+        # None (the default) preserves the old behaviour: upload to whichever
+        # channel is currently active for this session.
+        self.channel = channel
 
     async def upload(self, playwright: Playwright) -> None:
         browser_engine = _get_browser_engine()
@@ -656,8 +683,26 @@ class YouTubeVideo(BaseVideoUploader):
 
         youtube_logger.info(_msg("🎬", f"Starting upload: {Path(self.file_path).name}"))
         youtube_logger.info(_msg("🌐", f"Browser engine: {browser_engine}"))
+
+        upload_url = UPLOAD_URL
+        target_channel_id = None
+        if self.channel:
+            youtube_logger.info(_msg("📺", f"Resolving target channel: {self.channel}"))
+            target_channel_id = await _resolve_channel_id(page, self.channel)
+            upload_url = STUDIO_CHANNEL_UPLOAD_URL_TEMPLATE.format(channel_id=target_channel_id)
+            youtube_logger.info(_msg("📺", f"Targeting channel {self.channel} ({target_channel_id})"))
+
         youtube_logger.info(_msg("🌐", "Opening the YouTube upload page"))
-        file_input = await _open_upload_page(page)
+        file_input = await _open_upload_page(page, upload_url)
+
+        if target_channel_id and target_channel_id not in page.url:
+            raise RuntimeError(
+                f"Expected to land on channel {target_channel_id} ({self.channel}) but the "
+                f"upload page URL is {page.url} -- this Google account may not manage that "
+                f"channel, or Studio didn't honour the channel-scoped URL. Aborting rather "
+                f"than risk uploading to the wrong channel."
+            )
+
         youtube_logger.info(_msg("✅", "Upload page ready; selecting the video file"))
 
         # 1) Select the video file.

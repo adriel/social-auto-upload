@@ -252,6 +252,7 @@ class YouTubeVideoUploadRequest:
     thumbnail_file: Path | None = None
     playlist: str | None = None
     visibility: str = "public"
+    channel: str | None = None
     debug: bool = True
     headless: bool = False
 
@@ -399,6 +400,7 @@ async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> Path:
         thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
         playlist=request.playlist,
         visibility=request.visibility,
+        channel=request.channel,
         debug=request.debug,
         headless=request.headless,
     )
@@ -1012,6 +1014,11 @@ def build_parser() -> argparse.ArgumentParser:
     youtube_upload_video_parser.add_argument("--playlist", help="Optional playlist name to add the video to (for series)")
     youtube_upload_video_parser.add_argument(
         "--visibility", default="public", choices=["public", "unlisted", "private"], help="Video visibility")
+    youtube_upload_video_parser.add_argument(
+        "--channel",
+        help="Which channel to post to, if the Google account manages more than one "
+             "(handle like '@USA_weather_sat', or a raw 'UC...' channel ID). Omit to use "
+             "whichever channel is currently active for this session.")
     add_runtime_flags(youtube_upload_video_parser)
 
     baijiahao_parser = platform_parsers.add_parser("baijiahao", help="Baidu Baijiahao operations")
@@ -1399,6 +1406,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 thumbnail_file=args.thumbnail,
                 playlist=args.playlist,
                 visibility=args.visibility,
+                channel=args.channel,
                 debug=args.debug,
                 headless=args.headless,
             )

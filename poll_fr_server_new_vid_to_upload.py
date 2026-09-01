@@ -18,6 +18,8 @@ LOCK_FILE = Path.home() / ".sau_uploader.lock"
 DOWNLOAD_DIR = Path.home() / "sat_downloads"
 SAU_BIN = Path("/Users/adriel/Downloads/social-auto-upload/.venv/bin/sau")
 SAU_ACCOUNT = "me"
+SAU_YOUTUBE_CHANNEL = "@USA_weather_sat"  # NotBROLL is the Google account's default/last-active
+                                          # channel in Chrome; this pins uploads to the right one.
 
 DISCORD_WEBHOOK_URL = (
     "https://discord.com/api/webhooks/1543864739627671643/"
@@ -286,6 +288,7 @@ def main(args):
 
         cmd = [str(SAU_BIN), "youtube", "upload-video",
                "--account", SAU_ACCOUNT, "--file", str(local_path),
+               "--channel", SAU_YOUTUBE_CHANNEL,
                "--title", entry["title"][:100], "--desc", entry["description"],
                "--tags", ",".join(entry["tags"]),
                "--playlist", entry["playlist_title"], "--visibility", "public"]
