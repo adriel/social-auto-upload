@@ -19,7 +19,9 @@ DOWNLOAD_DIR = Path.home() / "sat_downloads"
 SAU_BIN = Path("/Users/adriel/Downloads/social-auto-upload/.venv/bin/sau")
 SAU_ACCOUNT = "me"
 SAU_YOUTUBE_CHANNEL = "@USA_weather_sat"  # NotBROLL is the Google account's default/last-active
-                                          # channel in Chrome; this pins uploads to the right one.
+                                          # channel in the local browser session (Safari by
+                                          # default -- see YT_LOCAL_BROWSER in the youtube
+                                          # uploader); this pins uploads to the right one.
 
 DISCORD_WEBHOOK_URL = (
     "https://discord.com/api/webhooks/1543864739627671643/"

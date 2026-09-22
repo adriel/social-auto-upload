@@ -179,25 +179,35 @@ def _debug(msg: str):
     print(f"[local-chrome-cookies] {msg}", file=sys.stderr, flush=True)
 
 
-def _load_local_chrome_cookiejar():
-    """Pull Google/YouTube cookies out of the local machine's own Chrome profile.
+def _load_local_browser_cookiejar():
+    """Pull Google/YouTube cookies out of the local machine's own Chrome or Safari
+    profile -- selected by YT_LOCAL_BROWSER ("safari", the default, or "chrome").
 
-    Only works where a real Chrome profile exists (e.g. your desktop Mac) — browser_cookie3
-    reads Chrome's on-disk cookie DB and decrypts it via the OS keychain (macOS will prompt
-    for Keychain access the first time this runs). Raises on any failure; callers decide how
-    to handle that.
+    Only works where a real signed-in browser profile exists (e.g. your desktop Mac).
+    Chrome's cookie DB is AES-encrypted and decrypted via the OS keychain (macOS will
+    prompt for Keychain access the first time this runs); Safari's cookie file
+    (~/Library/Containers/com.apple.Safari/.../Cookies.binarycookies) isn't encrypted
+    at all, but reading it -- like Chrome's DB -- needs Full Disk Access granted to
+    whatever process is running this (Terminal, or the launchd/cron agent's own
+    executable) in System Settings > Privacy & Security. Raises on any failure;
+    callers decide how to handle that.
     """
     import browser_cookie3  # Optional dependency; imported lazily so the rest of this
                              # module works fine without it installed.
 
-    _debug(f"browser_cookie3 module: {getattr(browser_cookie3, '__file__', 'unknown')}")
+    browser = os.environ.get("YT_LOCAL_BROWSER", "safari").strip().lower()
+    if browser not in {"chrome", "safari"}:
+        raise ValueError("YT_LOCAL_BROWSER must be 'chrome' or 'safari'")
+    fetch = browser_cookie3.chrome if browser == "chrome" else browser_cookie3.safari
 
-    jar = browser_cookie3.chrome(domain_name="google.com")
+    _debug(f"browser_cookie3 module: {getattr(browser_cookie3, '__file__', 'unknown')} (source: {browser})")
+
+    jar = fetch(domain_name="google.com")
     google_count = sum(1 for _ in jar)
     _debug(f"domain_name='google.com' -> {google_count} cookie(s)")
 
     yt_count = 0
-    for cookie in browser_cookie3.chrome(domain_name="youtube.com"):
+    for cookie in fetch(domain_name="youtube.com"):
         jar.set_cookie(cookie)
         yt_count += 1
     _debug(f"domain_name='youtube.com' -> {yt_count} cookie(s)")
@@ -205,7 +215,7 @@ def _load_local_chrome_cookiejar():
     found_key_names = sorted({c.name for c in jar if c.name in _KEY_AUTH_COOKIE_NAMES})
     _debug(f"key auth cookie names present: {found_key_names or 'NONE'}")
     if not found_key_names:
-        _debug("no recognizable Google auth cookies -- Chrome likely isn't signed "
+        _debug(f"no recognizable Google auth cookies -- {browser.capitalize()} likely isn't signed "
                "into a Google account in this profile (or it's a different profile "
                "than the one you're signed in on, e.g. a work profile vs personal)")
 
@@ -235,33 +245,36 @@ def _cookiejar_to_storage_state(jar) -> dict:
 
 
 async def _try_local_chrome_session(account_file) -> bool:
-    """Attempt to bootstrap account_file from the local machine's logged-in Chrome session.
+    """Attempt to bootstrap account_file from the local machine's logged-in Chrome (or,
+    with YT_LOCAL_BROWSER=safari, Safari) session.
 
     Returns False (leaving account_file untouched) on any failure — missing dependency,
-    no Chrome profile, no cookies found, or the resulting session not validating against
-    YouTube Studio — so the caller can fall back to the interactive login unchanged.
-    Set YT_SKIP_LOCAL_CHROME=1 to disable this path entirely (e.g. on the headless server).
+    no signed-in browser profile, no cookies found, or the resulting session not
+    validating against YouTube Studio — so the caller can fall back to the interactive
+    login unchanged. Set YT_SKIP_LOCAL_CHROME=1 to disable this path entirely (e.g. on
+    the headless server).
     """
     if os.environ.get("YT_SKIP_LOCAL_CHROME"):
         _debug("skipped: YT_SKIP_LOCAL_CHROME is set")
         return False
 
-    _debug("attempting to reuse the local Chrome session ...")
+    browser = os.environ.get("YT_LOCAL_BROWSER", "safari").strip().lower()
+    _debug(f"attempting to reuse the local {browser} session ...")
 
     try:
         import browser_cookie3  # noqa: F401
     except ImportError as exc:
         _debug(f"skipped: browser_cookie3 is not installed ({exc})")
-        youtube_logger.info(_msg("ℹ️", "browser_cookie3 not installed; skipping local Chrome cookie pull"))
+        youtube_logger.info(_msg("ℹ️", "browser_cookie3 not installed; skipping local browser cookie pull"))
         return False
 
     try:
-        jar = _load_local_chrome_cookiejar()
+        jar = _load_local_browser_cookiejar()
         storage_state = _cookiejar_to_storage_state(jar)
     except Exception as exc:
-        _debug(f"failed reading local Chrome cookies: {exc.__class__.__name__}: {exc}")
+        _debug(f"failed reading local {browser} cookies: {exc.__class__.__name__}: {exc}")
         _debug(traceback.format_exc())
-        youtube_logger.info(_msg("ℹ️", f"Could not read local Chrome cookies, skipping: {exc}"))
+        youtube_logger.info(_msg("ℹ️", f"Could not read local {browser} cookies, skipping: {exc}"))
         return False
 
     _debug(f"built storage_state with {len(storage_state['cookies'])} cookie(s) total")
@@ -279,13 +292,13 @@ async def _try_local_chrome_session(account_file) -> bool:
         _debug(f"cookie_auth() -> {valid}")
         if valid:
             os.replace(candidate_file, account_file)
-            youtube_logger.success(_msg("✅", "Reused the local Chrome session for YouTube Studio"))
+            youtube_logger.success(_msg("✅", f"Reused the local {browser} session for YouTube Studio"))
             return True
         _debug("cookie_auth() rejected the candidate session -- either the Chrome cookies "
                "aren't actually signed in to Studio's channel, or cookie_auth's own headless "
                "Chrome launch is itself getting blocked/redirected (e.g. the same UA/bot checks "
                "documented elsewhere in this file for headless sessions)")
-        youtube_logger.info(_msg("ℹ️", "Local Chrome cookies didn't produce a valid YouTube Studio session"))
+        youtube_logger.info(_msg("ℹ️", f"Local {browser} cookies didn't produce a valid YouTube Studio session"))
         return False
     except Exception as exc:
         _debug(f"failed validating candidate session: {exc.__class__.__name__}: {exc}")
