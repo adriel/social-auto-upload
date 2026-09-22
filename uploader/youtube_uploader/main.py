@@ -26,6 +26,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
+from urllib.parse import urljoin
 
 from patchright.async_api import Page, Playwright, async_playwright
 
@@ -436,14 +437,35 @@ async def _list_account_switcher_channels(page: Page) -> list:
     return channels
 
 
+async def _public_channel_id(page: Page, handle: str):
+    """Best-effort lookup of a handle's canonical channel ID from its public
+    youtube.com page. Used only as an independent cross-check in
+    _switch_to_channel: the post-switch '/channel/<id>' redirect confirms
+    *some* channel is active, but not that it's the one we asked for -- a
+    switch that silently no-ops still redirects to a /channel/<id> URL (the
+    previously-active one), which read as a false 'confirmed'. Returns None
+    (skip the cross-check) on any failure rather than raising, since this is
+    a bonus safeguard, not the primary mechanism."""
+    try:
+        resp = await page.request.get(f"https://www.youtube.com/@{handle.lstrip('@')}")
+        if resp.status != 200:
+            return None
+        html = await resp.text()
+    except Exception:
+        return None
+    m = re.search(r'"externalId":"(UC[0-9A-Za-z_-]{22})"', html)
+    return m.group(1) if m else None
+
+
 async def _switch_to_channel(page: Page, channel: str) -> str:
     """Switch the active identity to the given channel -- matched by handle (with
     or without '@') or exact display name against the account switcher's list --
     then confirm the switch via the same '/channel/<id>' redirect cookie_auth()
-    already relies on elsewhere in this file. Returns the new active channel's raw
-    ID. Raises rather than silently continuing if the requested channel can't be
-    found or the switch can't be confirmed -- this existing to prevent uploading
-    to the wrong channel is the whole point."""
+    already relies on elsewhere in this file, cross-checked (when the channel was
+    matched by handle) against that handle's public canonical channel ID. Returns
+    the new active channel's raw ID. Raises rather than silently continuing if the
+    requested channel can't be found or the switch can't be confirmed -- this
+    existing to prevent uploading to the wrong channel is the whole point."""
     target = channel.strip().lstrip("@").lower()
     channels = await _list_account_switcher_channels(page)
 
@@ -458,11 +480,20 @@ async def _switch_to_channel(page: Page, channel: str) -> str:
     if not match["signin_url"] and not match["is_selected"]:
         raise RuntimeError(f"Found channel '{channel}' in the account switcher but it had no signin URL to switch with")
 
+    expected_id = await _public_channel_id(page, match["handle"]) if match["handle"] else None
+
     if match["is_selected"]:
         youtube_logger.info(_msg("📺", f"'{channel}' is already the active channel"))
     else:
         youtube_logger.info(_msg("📺", f"Switching active channel to '{match['name']}' ({match['handle'] or channel})"))
-        await page.goto(match["signin_url"], wait_until="domcontentloaded")
+        # This signin_url comes from Studio's own account-switcher endpoint (its
+        # HAR capture), but it's YouTube's masthead account-switcher link, which
+        # is relative to www.youtube.com, not studio.youtube.com -- resolving it
+        # against the wrong domain sends the browser to a no-op page, the active
+        # identity never changes, and (without expected_id above) the redirect
+        # check below would happily "confirm" the still-wrong channel.
+        signin_url = urljoin("https://www.youtube.com/", match["signin_url"])
+        await page.goto(signin_url, wait_until="domcontentloaded")
 
     # Confirm by the same mechanism cookie_auth() already trusts: loading Studio
     # plain redirects to '/channel/<id-of-whichever-channel-is-now-active>'.
@@ -476,6 +507,12 @@ async def _switch_to_channel(page: Page, channel: str) -> str:
         raise RuntimeError(f"Switched to '{channel}' but Studio never redirected to a /channel/<id> URL "
                             f"(ended up at {page.url})")
     channel_id = id_match.group(1)
+    if expected_id and channel_id != expected_id:
+        raise RuntimeError(
+            f"Switched to '{channel}' but Studio's active channel is {channel_id}, not the expected "
+            f"{expected_id} -- the switch did not actually take effect. Aborting rather than risk "
+            f"uploading to the wrong channel."
+        )
     youtube_logger.info(_msg("✅", f"Active channel confirmed: {channel_id}"))
     return channel_id
 
