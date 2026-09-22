@@ -651,10 +651,15 @@ async def _publish_video(page: Page, timeout_s: int = YT_PUBLISH_TIMEOUT_S,
     response is somehow never seen, so this still works if Studio's response shape
     changes.
     """
-    done_button = page.locator("#done-button").first
-    await done_button.wait_for(state="visible", timeout=15000)
+    # #done-button is a <ytcp-button> custom element wrapping a native <button> --
+    # clicking the custom element itself is a no-op under WebKit (no click handler
+    # fires, no request is ever sent), even though Playwright reports it as visible
+    # and enabled. Chromium tolerates the outer-element click; WebKit doesn't. The
+    # inner native <button> is the real actionable target on both engines.
+    clickable_button = page.locator("#done-button button").first
+    await clickable_button.wait_for(state="visible", timeout=15000)
     for _ in range(240):
-        if await done_button.is_enabled():
+        if await clickable_button.is_enabled():
             break
         await page.wait_for_timeout(250)
     else:
@@ -679,7 +684,7 @@ async def _publish_video(page: Page, timeout_s: int = YT_PUBLISH_TIMEOUT_S,
 
     page.on("response", _on_response_sync)
     try:
-        await done_button.click(timeout=15000)
+        await clickable_button.click(timeout=15000)
 
         publish_anyway = page.locator(
             "ytcp-button:has-text('Publish anyway'), "
