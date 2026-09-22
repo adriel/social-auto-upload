@@ -109,15 +109,20 @@ def _build_login_result(success, status, message, account_file, current_url=""):
 
 async def cookie_auth(account_file) -> bool:
     """Return whether the saved session opens a YouTube Studio channel."""
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True, channel="chrome")
+    engine = _get_browser_engine()
+    async with _get_async_playwright_factory(engine)() as playwright:
+        browser_type = _get_browser_type(playwright, engine)
+        launch_options = {"headless": True}
+        if engine == "chrome":
+            launch_options["channel"] = "chrome"
+        browser = await browser_type.launch(**launch_options)
         try:
             context = await browser.new_context(
                 storage_state=account_file,
                 user_agent=(
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-                ),
+                ) if engine == "chrome" else None,
             )
             context = await set_init_script(context)
             page = await context.new_page()
@@ -138,9 +143,14 @@ async def cookie_auth(account_file) -> bool:
 
 async def youtube_cookie_gen(account_file, headless: bool = False):
     """Open an interactive login window and save its browser storage state."""
-    async with async_playwright() as playwright:
+    engine = _get_browser_engine()
+    async with _get_async_playwright_factory(engine)() as playwright:
+        browser_type = _get_browser_type(playwright, engine)
         # Login must remain headed for passwords and two-factor authentication.
-        browser = await playwright.chromium.launch(headless=False, channel="chrome")
+        launch_options = {"headless": False}
+        if engine == "chrome":
+            launch_options["channel"] = "chrome"
+        browser = await browser_type.launch(**launch_options)
         context = await browser.new_context()
         context = await set_init_script(context)
         page = await context.new_page()
