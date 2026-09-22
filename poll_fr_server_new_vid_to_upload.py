@@ -16,7 +16,7 @@ MANIFEST_URL = "https://usernmaejkhgdfys:4hgj354g3j5h@ljhgfdhtryjfygjh.lionfabri
 STATE_FILE = Path.home() / ".sau_uploader_state.json"
 LOCK_FILE = Path.home() / ".sau_uploader.lock"
 DOWNLOAD_DIR = Path.home() / "sat_downloads"
-SAU_BIN = Path("/Users/plex/Documents/GitHub/social-auto-upload/.venv/bin/sau")
+SAU_BIN = Path("/Users/plex/sau-uploader/.venv/bin/sau")
 SAU_ACCOUNT = "me"
 SAU_YOUTUBE_CHANNEL = "@USA_weather_sat"  # NotBROLL is the Google account's default/last-active
                                           # channel in the local browser session (Safari by
