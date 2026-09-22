@@ -55,8 +55,6 @@ except Exception:
 
 STUDIO_URL = "https://studio.youtube.com"
 UPLOAD_URL = "https://www.youtube.com/upload"
-STUDIO_CHANNEL_UPLOAD_URL_TEMPLATE = "https://studio.youtube.com/channel/{channel_id}/videos/upload"
-_CHANNEL_ID_RE = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
 VISIBILITY = {"public": "PUBLIC", "unlisted": "UNLISTED", "private": "PRIVATE"}
 DEFAULT_BROWSER_ENGINE = "webkit"
 
@@ -387,22 +385,99 @@ async def _select_visibility(page: Page, visibility: str, max_polls: int = 20) -
     return False
 
 
-async def _resolve_channel_id(page: Page, channel: str) -> str:
-    """Resolve a channel handle ('@USA_weather_sat', with or without the '@') or an
-    already-raw channel ID ('UC...', 24 chars) to its raw channel ID. Studio's
-    per-channel URLs need the raw ID; a handle is resolved by visiting its public
-    youtube.com page and pulling the canonical channel ID out of it."""
-    channel = channel.strip()
-    if _CHANNEL_ID_RE.match(channel):
-        return channel
-    handle = channel if channel.startswith("@") else f"@{channel}"
-    url = f"https://www.youtube.com/{handle}"
-    await page.goto(url, wait_until="domcontentloaded")
-    html = await page.content()
-    match = re.search(r'"channelId":"(UC[0-9A-Za-z_-]{22})"', html)
-    if not match:
-        raise RuntimeError(f"Couldn't resolve a channel ID for '{channel}' from {url}")
-    return match.group(1)
+ACCOUNT_SWITCHER_ENDPOINT = f"{STUDIO_URL}/getAccountSwitcherEndpoint"
+
+
+def _strip_xssi_prefix(text: str) -> str:
+    """This endpoint (unlike the youtubei/v1/* APIs used elsewhere in this file)
+    prefixes its JSON body with ")]}'" to prevent JSON-hijacking via a <script
+    src=...> include. Strip it before parsing."""
+    if text.startswith(")]}'"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[4:]
+    return text.lstrip()
+
+
+async def _list_account_switcher_channels(page: Page) -> list:
+    """List every identity (personal Google account + each brand-account channel)
+    the current login can switch into -- display name, handle (if it has one),
+    and the signin URL that actually performs the switch. This mirrors exactly
+    what clicking Studio's avatar -> account-switcher menu does; the endpoint and
+    response shape were captured from a HAR of that flow, not guessed."""
+    resp = await page.request.get(ACCOUNT_SWITCHER_ENDPOINT)
+    if resp.status != 200:
+        raise RuntimeError(f"getAccountSwitcherEndpoint returned HTTP {resp.status}")
+    data = json.loads(_strip_xssi_prefix(await resp.text()))
+    try:
+        contents = (data["data"]["actions"][0]["getMultiPageMenuAction"]["menu"]
+                    ["multiPageMenuRenderer"]["sections"][0]["accountSectionListRenderer"]
+                    ["contents"][0]["accountItemSectionRenderer"]["contents"])
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            f"getAccountSwitcherEndpoint's response shape wasn't what was expected ({exc}) "
+            f"-- YouTube may have changed it since this was captured."
+        )
+
+    channels = []
+    for entry in contents:
+        item = entry.get("accountItem", {})
+        tokens = (item.get("serviceEndpoint", {})
+                      .get("selectActiveIdentityEndpoint", {})
+                      .get("supportedTokens", []))
+        signin_url = next(
+            (t["accountSigninToken"]["signinUrl"] for t in tokens if "accountSigninToken" in t),
+            None,
+        )
+        channels.append({
+            "name": (item.get("accountName") or {}).get("simpleText", ""),
+            "handle": (item.get("channelHandle") or {}).get("simpleText", ""),
+            "is_selected": bool(item.get("isSelected")),
+            "signin_url": signin_url,
+        })
+    return channels
+
+
+async def _switch_to_channel(page: Page, channel: str) -> str:
+    """Switch the active identity to the given channel -- matched by handle (with
+    or without '@') or exact display name against the account switcher's list --
+    then confirm the switch via the same '/channel/<id>' redirect cookie_auth()
+    already relies on elsewhere in this file. Returns the new active channel's raw
+    ID. Raises rather than silently continuing if the requested channel can't be
+    found or the switch can't be confirmed -- this existing to prevent uploading
+    to the wrong channel is the whole point."""
+    target = channel.strip().lstrip("@").lower()
+    channels = await _list_account_switcher_channels(page)
+
+    match = next(
+        (c for c in channels if c["handle"].lstrip("@").lower() == target
+         or c["name"].strip().lower() == target),
+        None,
+    )
+    if match is None:
+        available = ", ".join(f"{c['name']!r} ({c['handle'] or 'no handle'})" for c in channels)
+        raise RuntimeError(f"No channel matching '{channel}' in the account switcher. Available: {available}")
+    if not match["signin_url"] and not match["is_selected"]:
+        raise RuntimeError(f"Found channel '{channel}' in the account switcher but it had no signin URL to switch with")
+
+    if match["is_selected"]:
+        youtube_logger.info(_msg("📺", f"'{channel}' is already the active channel"))
+    else:
+        youtube_logger.info(_msg("📺", f"Switching active channel to '{match['name']}' ({match['handle'] or channel})"))
+        await page.goto(match["signin_url"], wait_until="domcontentloaded")
+
+    # Confirm by the same mechanism cookie_auth() already trusts: loading Studio
+    # plain redirects to '/channel/<id-of-whichever-channel-is-now-active>'.
+    await page.goto(STUDIO_URL, wait_until="domcontentloaded")
+    for _ in range(40):
+        if "/channel/" in page.url:
+            break
+        await page.wait_for_timeout(250)
+    id_match = re.search(r"/channel/(UC[0-9A-Za-z_-]{22})", page.url)
+    if not id_match:
+        raise RuntimeError(f"Switched to '{channel}' but Studio never redirected to a /channel/<id> URL "
+                            f"(ended up at {page.url})")
+    channel_id = id_match.group(1)
+    youtube_logger.info(_msg("✅", f"Active channel confirmed: {channel_id}"))
+    return channel_id
 
 
 async def _open_upload_page(page: Page, upload_url: str = UPLOAD_URL):
@@ -684,25 +759,21 @@ class YouTubeVideo(BaseVideoUploader):
         youtube_logger.info(_msg("🎬", f"Starting upload: {Path(self.file_path).name}"))
         youtube_logger.info(_msg("🌐", f"Browser engine: {browser_engine}"))
 
-        upload_url = UPLOAD_URL
-        target_channel_id = None
         if self.channel:
-            youtube_logger.info(_msg("📺", f"Resolving target channel: {self.channel}"))
-            target_channel_id = await _resolve_channel_id(page, self.channel)
-            upload_url = STUDIO_CHANNEL_UPLOAD_URL_TEMPLATE.format(channel_id=target_channel_id)
-            youtube_logger.info(_msg("📺", f"Targeting channel {self.channel} ({target_channel_id})"))
+            # _switch_to_channel() switches the session's active identity and confirms
+            # it via Studio's own '/channel/<id>' redirect. That's session-wide, not
+            # scoped to studio.youtube.com -- the plain upload URL below already
+            # targets "whichever channel is currently active" (that's how this worked
+            # for the single-channel/default case from the start), so there's nothing
+            # further to do here. A channel-scoped Studio URL
+            # (studio.youtube.com/channel/<id>/videos/upload) was tried and doesn't
+            # work: it just loads the normal dashboard, not the upload dialog --
+            # reaching that dialog needs an actual "Create" -> "Upload videos" click,
+            # which the plain /upload URL below bypasses entirely.
+            await _switch_to_channel(page, self.channel)
 
         youtube_logger.info(_msg("🌐", "Opening the YouTube upload page"))
-        file_input = await _open_upload_page(page, upload_url)
-
-        if target_channel_id and target_channel_id not in page.url:
-            raise RuntimeError(
-                f"Expected to land on channel {target_channel_id} ({self.channel}) but the "
-                f"upload page URL is {page.url} -- this Google account may not manage that "
-                f"channel, or Studio didn't honour the channel-scoped URL. Aborting rather "
-                f"than risk uploading to the wrong channel."
-            )
-
+        file_input = await _open_upload_page(page, UPLOAD_URL)
         youtube_logger.info(_msg("✅", "Upload page ready; selecting the video file"))
 
         # 1) Select the video file.
