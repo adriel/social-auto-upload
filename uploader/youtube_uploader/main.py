@@ -59,6 +59,49 @@ UPLOAD_URL = "https://www.youtube.com/upload"
 VISIBILITY = {"public": "PUBLIC", "unlisted": "UNLISTED", "private": "PRIVATE"}
 DEFAULT_BROWSER_ENGINE = "webkit"
 
+# Auto-appended to the description of any Shorts-eligible upload (in addition to
+# whatever hashtags the caller's own description/tags already carry). 3-5 relevant
+# hashtags is the generally recommended range for Shorts -- YouTube's own topic
+# matching weights the first few far more than a long stack, and over-tagging
+# reads as spammy without helping discovery. These four are topically distinct
+# (content type, subject, format, conditional topic) rather than redundant, so
+# all four are kept rather than trimmed further.
+SHORTS_HASHTAGS = ["#satellite", "#weather", "#timelapse", "#storm"]
+
+
+def _is_shorts_video(file_path: str) -> bool:
+    """Best-effort local check for YouTube Shorts eligibility (square/vertical
+    aspect ratio, duration within YouTube's current Shorts length policy).
+
+    Checked locally via OpenCV (already a project dependency, so no new install
+    needed and it isn't affected by launchd's minimal PATH the way an ffprobe
+    subprocess call would be) rather than waited-out in the upload wizard's DOM
+    -- the classic Tags box this determines whether to skip simply does not
+    exist for Shorts, so probing for it there only wastes a ~60s locator
+    timeout every time. Returns False (treat as a regular video) on any read
+    failure, which preserves today's existing behavior rather than silently
+    skipping steps that might still apply.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return False
+    try:
+        cap = cv2.VideoCapture(file_path)
+        try:
+            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        finally:
+            cap.release()
+    except Exception:
+        return False
+    if not width or not height or not fps:
+        return False
+    duration_s = frame_count / fps
+    return height >= width and duration_s <= 180
+
 
 def _get_browser_engine() -> str:
     """Return the upload browser engine selected by the environment."""
@@ -782,6 +825,7 @@ class YouTubeVideo(BaseVideoUploader):
         # None (the default) preserves the old behaviour: upload to whichever
         # channel is currently active for this session.
         self.channel = channel
+        self.is_shorts = _is_shorts_video(self.file_path)
 
     async def upload(self, playwright: Playwright) -> None:
         browser_engine = _get_browser_engine()
@@ -852,10 +896,19 @@ class YouTubeVideo(BaseVideoUploader):
         youtube_logger.info(_msg("✍️", "Entering title"))
         await _fill_editable(page, "#title-textarea #textbox", self.title[:100])
 
-        # 4) Description.
-        if self.description.strip():
+        # 4) Description. For Shorts, append whichever of SHORTS_HASHTAGS aren't
+        # already present (e.g. the manifest's own description may already carry
+        # some of them) -- Shorts don't have the classic Tags box below (see the
+        # skip at step 8), so the description's inline hashtags are the only place
+        # for these to go.
+        description = self.description
+        if self.is_shorts:
+            missing = [h for h in SHORTS_HASHTAGS if h.lower() not in description.lower()]
+            if missing:
+                description = (description.rstrip() + "\n\n" if description.strip() else "") + " ".join(missing)
+        if description.strip():
             youtube_logger.info(_msg("✍️", "Entering description"))
-            await _fill_editable(page, "#description-textarea #textbox", self.description)
+            await _fill_editable(page, "#description-textarea #textbox", description)
 
         # 5) Thumbnail. YouTube may reject it until initial processing has advanced;
         # failure is non-fatal.
@@ -903,8 +956,11 @@ class YouTubeVideo(BaseVideoUploader):
         if not await _click_if_present(page, "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']", 10000):
             await _click_if_present(page, "tp-yt-paper-radio-button:has-text('not made for kids')", 6000)
 
-        # 8) Tags, under Show more.
-        if self.tags:
+        # 8) Tags, under Show more. Shorts don't have this classic Tags box at
+        # all -- skip outright rather than burning a ~60s locator timeout on a
+        # control that will never appear (its hashtags went into the description
+        # instead, in step 4).
+        if self.tags and not self.is_shorts:
             try:
                 await _click_if_present(page, "#toggle-button", 6000)
                 await page.wait_for_timeout(800)
