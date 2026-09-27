@@ -7,6 +7,7 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 
@@ -14,6 +15,11 @@ import requests
 MANIFEST_URL = "https://usernmaejkhgdfys:4hgj354g3j5h@ljhgfdhtryjfygjh.lionfabric.page/GOES/manifest.json"
 
 STATE_FILE = Path.home() / ".sau_uploader_state.json"
+# Kept separate from STATE_FILE on purpose: STATE_FILE is a plain JSON list of
+# filenames, and any older copy of this script reading it as a dict-shaped file
+# would see zero "done" entries and re-upload every video. Thumbnail outcomes
+# ("set" / "failed" / "skipped" / "unknown") are informational only.
+THUMB_STATE_FILE = Path.home() / ".sau_uploader_thumbnails.json"
 LOCK_FILE = Path.home() / ".sau_uploader.lock"
 DOWNLOAD_DIR = Path.home() / "sat_downloads"
 SAU_BIN = Path("/Users/plex/sau-uploader/.venv/bin/sau")
@@ -223,12 +229,139 @@ def save_state(done):
     tmp.replace(STATE_FILE)
 
 
+def load_thumb_state() -> dict:
+    try:
+        data = json.loads(THUMB_STATE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_thumb_state(thumbs: dict):
+    tmp = THUMB_STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(dict(sorted(thumbs.items())), indent=1))
+    tmp.replace(THUMB_STATE_FILE)
+
+
+THUMB_MAX_BYTES = 2_000_000  # YouTube rejects custom thumbnails over 2 MB
+THUMB_SIZE = (1280, 720)     # (width, height)
+_THUMB_MARKER_RE = re.compile(r"SAU_THUMBNAIL=(\w+)")
+_SAU_WARNING_RE = re.compile(r"\| WARNING:\s*(.+)")
+
+
+def _is_short_entry(entry: dict) -> bool:
+    """Shorts don't get custom thumbnails. The server names them
+    us_satellite_shorts_* and ends their title with #Shorts."""
+    return ("#shorts" in entry.get("title", "").lower()
+            or "_shorts_" in entry.get("filename", "").lower())
+
+
+def _with_manifest_auth(url: str) -> str:
+    """The thumbnail sits behind the same basic auth as the manifest and the
+    videos (the video URL inherits it from MANIFEST_URL, but thumbnail_url is
+    absolute). Add the manifest's credentials only when the host is the same
+    one, so they never get sent to some other host."""
+    target, manifest = urlsplit(url), urlsplit(MANIFEST_URL)
+    if target.username or not manifest.username or target.hostname != manifest.hostname:
+        return url
+    creds = f"{quote(manifest.username, safe='')}:{quote(manifest.password or '', safe='')}"
+    return urlunsplit(target._replace(netloc=f"{creds}@{target.netloc}"))
+
+
+def _validate_thumbnail(path: Path):
+    """Return None if the file is an acceptable YouTube thumbnail, otherwise a
+    short human-readable reason it isn't."""
+    size = path.stat().st_size
+    if size > THUMB_MAX_BYTES:
+        return f"{size:,} bytes is over the {THUMB_MAX_BYTES:,}-byte limit"
+    with open(path, "rb") as f:
+        if f.read(3) != b"\xff\xd8\xff":
+            return "not a JPEG (bad file signature)"
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return "can't validate (cv2/numpy not installed)"
+    image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return "not a decodable JPEG"
+    height, width = image.shape[:2]
+    if (width, height) != THUMB_SIZE:
+        return f"{width}x{height} is not {THUMB_SIZE[0]}x{THUMB_SIZE[1]}"
+    return None
+
+
+def _prepare_thumbnail(entry: dict, warnings: list, log=None):
+    """Download + validate the entry's thumbnail, if it has one. Returns the
+    local Path, or None (no thumbnail, a Short, or anything went wrong).
+
+    Never raises: a thumbnail problem must not fail or block the video upload,
+    so every failure becomes a warning (collected and sent to Discord once the
+    video itself has uploaded) and the video goes up without one."""
+    url, name = entry.get("thumbnail_url"), entry.get("thumbnail_filename")
+    if not url and not name:
+        return None
+    filename = entry["filename"]
+    if _is_short_entry(entry):
+        if log:
+            log(f"  {filename}: Short -- skipping custom thumbnail")
+        return None
+
+    dest = None
+    try:
+        if not url or not url.startswith(("http://", "https://")):
+            url = MANIFEST_URL[: -len("manifest.json")] + (name or url).lstrip("/")
+        url = _with_manifest_auth(url)
+        # Path(...).name keeps a manifest-supplied name from escaping DOWNLOAD_DIR.
+        dest = DOWNLOAD_DIR / Path(name or urlsplit(url).path).name
+        DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+        if dest.exists() and dest.stat().st_size == _remote_content_length(url, log=log):
+            if log:
+                log(f"  {filename}: reusing already-downloaded thumbnail {dest.name}")
+        else:
+            if log:
+                log(f"  {filename}: downloading thumbnail from {_redact_url(url)} ...")
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            dest.write_bytes(resp.content)
+
+        reason = _validate_thumbnail(dest)
+        if reason:
+            dest.unlink(missing_ok=True)
+            warnings.append(f"thumbnail rejected ({dest.name}): {reason} -- uploading without one")
+            return None
+        if log:
+            log(f"  {filename}: thumbnail OK ({dest.name}, {dest.stat().st_size:,} bytes)")
+        return dest
+    except Exception as e:
+        if dest is not None:
+            dest.unlink(missing_ok=True)
+        # requests' error text embeds the full URL, which carries the basic-auth
+        # credentials -- redact before it can reach the log or Discord.
+        detail = _redact_url(f"{e.__class__.__name__}: {e}")
+        warnings.append(f"thumbnail unavailable ({detail}) -- uploading without one")
+        return None
+
+
+def _sau_warnings(output: str) -> list:
+    """WARNING lines sau logged during an otherwise successful upload (skipped
+    tags/playlist/thumbnail steps, etc)."""
+    seen = []
+    for line in output.splitlines():
+        m = _SAU_WARNING_RE.search(line)
+        if m and m.group(1).strip() not in seen:
+            seen.append(m.group(1).strip()[:300])
+    return seen[:8]
+
+
 def main(args):
     log = (lambda msg: print(msg, flush=True)) if args.verbose else None
 
     acquire_lock_or_exit(log=log)
 
     done = load_state()
+    thumbs = load_thumb_state()
     if log:
         log(f"  {len(done)} filename(s) already marked done")
 
@@ -288,12 +421,25 @@ def main(args):
             if log:
                 log(f"  {filename}: downloaded {local_path.stat().st_size / 1e6:.0f} MB")
 
+        # Honor the manifest's own visibility, falling back to public for a
+        # missing/unrecognized value.
+        visibility = entry.get("visibility")
+        if visibility not in ("public", "unlisted", "private"):
+            if visibility and log:
+                log(f"  {filename}: unrecognized visibility {visibility!r}, using public")
+            visibility = "public"
+
+        warnings = []  # sent to Discord once, after the video has uploaded
+        thumb_path = _prepare_thumbnail(entry, warnings, log=log)
+
         cmd = [str(SAU_BIN), "youtube", "upload-video",
                "--account", SAU_ACCOUNT, "--file", str(local_path),
                "--channel", SAU_YOUTUBE_CHANNEL,
                "--title", entry["title"][:100], "--desc", entry["description"],
                "--tags", ",".join(entry["tags"]),
-               "--playlist", entry["playlist_title"], "--visibility", "public"]
+               "--playlist", entry["playlist_title"], "--visibility", visibility]
+        if thumb_path:
+            cmd += ["--thumbnail", str(thumb_path)]
         if log:
             log(f"  {filename}: running sau upload-video ...")
 
@@ -306,10 +452,30 @@ def main(args):
             print(f"uploaded {filename}")
             if log:
                 log(f"  {filename}: state saved, local copy removed")
+
+            if thumb_path:
+                markers = _THUMB_MARKER_RE.findall(output)
+                outcome = markers[-1] if markers else "unknown"
+                thumbs[filename] = outcome
+                try:
+                    save_thumb_state(thumbs)
+                except OSError as e:
+                    warnings.append(f"couldn't save thumbnail state: {e}")
+                if outcome != "set":
+                    warnings.append(f"thumbnail was NOT set on the video (uploader reported: {outcome})")
+                thumb_path.unlink(missing_ok=True)
+            warnings += _sau_warnings(output)
+            if warnings:
+                lines = "\n".join(f"- {w}" for w in warnings)
+                print(f"warnings for {filename}:\n{lines}")
+                notify_discord(f"GOES uploader: uploaded {filename} with warnings\n```\n{lines[:1700]}\n```")
         else:
             msg = f"sau upload failed for {filename}:\n{output}"
             print(msg)
-            notify_discord(f"GOES uploader: sau upload failed\n```\n{msg[:1500]}\n```")
+            # Head + tail: the failure reason and the "Saved diagnostics: <path>"
+            # line sau prints are at the END of a long log.
+            snippet = msg if len(msg) <= 1500 else msg[:500] + "\n...\n" + msg[-950:]
+            notify_discord(f"GOES uploader: sau upload failed\n```\n{snippet}\n```")
             # Left on disk deliberately -- next run will reuse it (see the
             # already_downloaded check above) rather than re-downloading, since
             # sau wasn't the download's problem.

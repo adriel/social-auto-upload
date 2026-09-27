@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 from urllib.parse import urljoin
@@ -602,6 +603,57 @@ async def _wait_for_details_editor(page: Page):
     await title_box.wait_for(state="visible", timeout=60000)
 
 
+DIAG_DIR = Path(os.environ.get("YT_DIAG_DIR") or Path.home() / ".sau_uploader" / "diagnostics")
+DIAG_KEEP = 40  # newest N screenshot+text pairs kept
+
+
+async def _dump_diagnostics(page: Page, label: str):
+    """Best-effort: save a screenshot and the upload dialog's visible text so a
+    stuck or failed wizard step can be diagnosed after the fact (the wizard
+    occasionally stalls for ~90s and the log alone can't say why). Never raises."""
+    try:
+        DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        base = DIAG_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{label}"
+        await page.screenshot(path=f"{base}.png", timeout=15000)
+        try:
+            dialog_text = await page.locator("ytcp-uploads-dialog").first.inner_text(timeout=5000)
+        except Exception:
+            dialog_text = "(upload dialog not found)"
+        Path(f"{base}.txt").write_text(f"url: {page.url}\n\n{dialog_text}\n")
+        for old in sorted(DIAG_DIR.iterdir())[:-DIAG_KEEP * 2]:
+            old.unlink(missing_ok=True)
+        youtube_logger.info(_msg("🩺", f"Saved diagnostics: {base}.png"))
+    except Exception:
+        pass
+
+
+async def _set_thumbnail(page: Page, thumbnail_path: str):
+    """Upload a custom thumbnail in the Details step and confirm YouTube took it.
+    Raises if it didn't. Confirmation = the slot's "Uploading..." state clears, no
+    error tip is shown, and the empty slot's "Upload file" button is gone."""
+    editor = page.locator("ytcp-video-thumbnail-editor").first
+    thumb_input = page.locator(
+        "#file-loader input[type='file'], ytcp-thumbnail-uploader input[type='file']"
+    ).first
+    await thumb_input.wait_for(state="attached", timeout=20000)
+    await thumb_input.set_input_files(thumbnail_path)
+    await page.wait_for_timeout(1500)  # give "Uploading..." time to appear
+    for _ in range(60):
+        if "Uploading" not in await editor.inner_text(timeout=3000):
+            break
+        await page.wait_for_timeout(500)
+    else:
+        raise RuntimeError("the thumbnail upload never finished")
+    error = (await editor.locator(".error-tip-container").inner_text(timeout=3000)).strip()
+    if error:
+        raise RuntimeError(f"YouTube rejected the thumbnail: {error}")
+    if "Upload file" in await editor.locator("ytcp-video-custom-still-editor").inner_text(timeout=3000):
+        # YouTube's own reason (e.g. "File is corrupted") is the text after the
+        # section blurb.
+        shown = " ".join((await editor.inner_text(timeout=3000)).split()).split("Learn more", 1)[-1].strip()
+        raise RuntimeError(f"the thumbnail slot is still empty after uploading (Studio shows: {shown[:120]})")
+
+
 PROGRESS_LOG_BUCKET_PCT = 20  # Log a progress line at most once per 20% (~5 total for 0-100%).
 
 
@@ -864,6 +916,7 @@ class YouTubeVideo(BaseVideoUploader):
 
         page = await context.new_page()
         page.set_default_timeout(60000)
+        self._page = page
 
         youtube_logger.info(_msg("🎬", f"Starting upload: {Path(self.file_path).name}"))
         youtube_logger.info(_msg("🌐", f"Browser engine: {browser_engine}"))
@@ -910,19 +963,27 @@ class YouTubeVideo(BaseVideoUploader):
             youtube_logger.info(_msg("✍️", "Entering description"))
             await _fill_editable(page, "#description-textarea #textbox", description)
 
-        # 5) Thumbnail. YouTube may reject it until initial processing has advanced;
-        # failure is non-fatal.
-        if self.thumbnail_path and Path(self.thumbnail_path).exists():
-            try:
-                thumb_input = page.locator(
-                    "#file-loader input[type='file'], ytcp-thumbnail-uploader input[type='file']"
-                ).first
-                await thumb_input.wait_for(state="attached", timeout=20000)
-                await thumb_input.set_input_files(self.thumbnail_path)
-                await page.wait_for_timeout(2000)
-                youtube_logger.info(_msg("🖼️", "Thumbnail uploaded"))
-            except Exception as exc:
-                youtube_logger.warning(_msg("⚠️", f"Thumbnail skipped; publishing can continue: {exc}"))
+        # 5) Thumbnail. Non-fatal: a thumbnail problem must never block the video.
+        # Shorts have no custom thumbnail control, so skip them rather than wait
+        # out a locator timeout. The outcome goes out as a SAU_THUMBNAIL=<...>
+        # line for the calling script to record.
+        if self.thumbnail_path:
+            if self.is_shorts:
+                outcome = "skipped"
+                youtube_logger.info(_msg("ℹ️", "Shorts don't take a custom thumbnail; skipping"))
+            elif not Path(self.thumbnail_path).exists():
+                outcome = "failed"
+                youtube_logger.warning(_msg("⚠️", f"Thumbnail file not found: {self.thumbnail_path}"))
+            else:
+                try:
+                    await _set_thumbnail(page, self.thumbnail_path)
+                    outcome = "set"
+                    youtube_logger.info(_msg("🖼️", "Thumbnail uploaded"))
+                except Exception as exc:
+                    outcome = "failed"
+                    youtube_logger.warning(_msg("⚠️", f"Thumbnail skipped; publishing can continue: {exc}"))
+                    await _dump_diagnostics(page, "thumbnail-failed")
+            print(f"SAU_THUMBNAIL={outcome}", flush=True)
 
         # 6) Add the video to a playlist. Always close the playlist dialog because
         # it blocks later controls.
@@ -947,6 +1008,7 @@ class YouTubeVideo(BaseVideoUploader):
                             await _click_if_present(page, "ytcp-button#create-button, tp-yt-paper-dialog ytcp-button:has-text('Create')", 4000)
             except Exception as exc:
                 youtube_logger.warning(_msg("⚠️", f"Playlist step skipped; publishing can continue: {exc}"))
+                await _dump_diagnostics(page, "playlist-skipped")
             finally:
                 await _click_if_present(page, "ytcp-playlist-dialog #save-button, ytcp-button:has-text('Done')", 3000)
                 await page.keyboard.press("Escape")
@@ -969,6 +1031,7 @@ class YouTubeVideo(BaseVideoUploader):
                 await tag_input.type(",".join(self.tags)[:500] + ",", delay=4)
             except Exception as exc:
                 youtube_logger.warning(_msg("⚠️", f"Tags skipped; publishing can continue: {exc}"))
+                await _dump_diagnostics(page, "tags-skipped")
 
         # 9) Advance to Visibility.
         for _ in range(5):
@@ -1011,4 +1074,10 @@ class YouTubeVideo(BaseVideoUploader):
     async def main(self):
         engine = _get_browser_engine()
         async with _get_async_playwright_factory(engine)() as playwright:
-            await self.upload(playwright)
+            try:
+                await self.upload(playwright)
+            except Exception:
+                page = getattr(self, "_page", None)
+                if page is not None:
+                    await _dump_diagnostics(page, "upload-failed")
+                raise
