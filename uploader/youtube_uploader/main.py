@@ -1010,9 +1010,25 @@ class YouTubeVideo(BaseVideoUploader):
                 youtube_logger.warning(_msg("⚠️", f"Playlist step skipped; publishing can continue: {exc}"))
                 await _dump_diagnostics(page, "playlist-skipped")
             finally:
-                await _click_if_present(page, "ytcp-playlist-dialog #save-button, ytcp-button:has-text('Done')", 3000)
-                await page.keyboard.press("Escape")
+                done = "ytcp-playlist-dialog #save-button, ytcp-playlist-dialog ytcp-button:has-text('Done')"
+                await _click_if_present(page, done, 3000)
                 await page.wait_for_timeout(600)
+                # Escape only if the playlist popup is genuinely still open. With
+                # nothing else on top, Escape lands on the upload dialog itself and
+                # minimizes it to the "Uploading 1 of 1" corner panel -- every later
+                # step then times out against a dialog that's gone, the run fails,
+                # and the closed browser leaves a draft stuck at ~30% uploaded.
+                if await page.locator(done).first.is_visible():
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(600)
+
+        # Fail fast if the upload dialog closed anyway, instead of burning ~2
+        # minutes of locator timeouts on the remaining steps.
+        try:
+            await page.locator("#title-textarea #textbox").first.wait_for(state="visible", timeout=5000)
+        except Exception:
+            await _dump_diagnostics(page, "dialog-closed")
+            raise RuntimeError("The YouTube upload dialog closed unexpectedly after the playlist step")
 
         # 7) Audience: not made for children (required).
         if not await _click_if_present(page, "tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']", 10000):
